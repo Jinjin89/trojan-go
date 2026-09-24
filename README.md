@@ -94,6 +94,108 @@ Trojan-Go 服务端兼容所有原 Trojan 客户端，如 Igniter、ShadowRocket
         /path/in/container/config.json
     ```
 
+5. 使用 Docker Compose 从源码构建并部署（推荐，详见[下一节](#docker-compose-部署)）
+
+    ```shell
+    docker compose up -d --build
+    ```
+
+## Docker Compose 部署
+
+仓库根目录的 `docker-compose.yml` 会用**本仓库的源码**构建镜像（而不是拉取 `p4gefau1t/trojan-go` 镜像），并以服务端模式运行：
+
+- 使用 host 网络，没有 docker-proxy 转发和 NAT 的额外开销
+- 文件描述符上限提高到 524288（Docker 默认的 1024 在连接数多时会耗尽）
+- 日志自动轮转（单个文件最大 20MB，保留 3 个），不会占满磁盘
+- 异常退出后自动重启（`restart: unless-stopped`）
+
+### 1. 准备配置文件和证书
+
+默认目录结构如下（可以通过环境变量修改，见第 2 步）：
+
+```text
+/root/tg/kuan/trojan-go/config/config.json   → 容器内 /tg/config/config.json
+/root/tg/kuan/cert/                          → 容器内 /cert/
+```
+
+`config.json` 中引用的证书路径要写**容器内**的路径。下面是一个 WebSocket + CDN（如 Cloudflare）的服务端配置示例：
+
+```json
+{
+  "run_type": "server",
+  "local_addr": "0.0.0.0",
+  "local_port": 2053,
+  "remote_addr": "127.0.0.1",
+  "remote_port": 80,
+  "password": ["your_password"],
+  "ssl": {
+    "cert": "/cert/your-domain.com/cert.pem",
+    "key": "/cert/your-domain.com/key.pem",
+    "sni": "your-domain.com"
+  },
+  "websocket": {
+    "enabled": true,
+    "path": "/ws",
+    "hostname": "your-domain.com"
+  }
+}
+```
+
+- `remote_addr` / `remote_port` 是回落用的 HTTP 服务（例如本机的 nginx）。非 Trojan 流量会被转发到这里，让服务器看起来像一个普通网站。启动时该服务暂时不可用也没关系，只会打印警告。
+- 使用 Cloudflare 时，`local_port` 需要选用 Cloudflare 支持的 HTTPS 端口（443、2053、2083、2087、2096、8443），SSL/TLS 模式设为 **Full (strict)**，并开启 **WebSockets**。证书可以用 Cloudflare Origin 证书。
+
+### 2. 修改挂载目录（可选）
+
+如果配置和证书不在默认目录，在 `docker-compose.yml` 同目录下创建 `.env` 文件：
+
+```shell
+TROJAN_CONFIG_DIR=/path/to/config   # 包含 config.json 的目录
+TROJAN_CERT_DIR=/path/to/cert       # 包含证书的目录
+```
+
+### 3. 构建并启动
+
+```shell
+git clone https://github.com/Jinjin89/trojan-go.git
+cd trojan-go
+docker compose up -d --build
+```
+
+如果之前已经用 `docker run` 或其他 compose 文件运行过名为 `trojan-go` 的容器，先删除它，否则容器名和端口会冲突：
+
+```shell
+docker stop trojan-go && docker rm trojan-go
+docker compose up -d --build
+```
+
+> 注意：删除旧容器后，不要再在旧的 compose 目录中执行 `docker compose up`，否则旧镜像会被重新启动并占用同一端口。
+
+### 4. 检查运行状态
+
+```shell
+docker compose ps                 # 查看状态
+docker compose logs -f            # 实时查看日志
+ss -tlnp | grep trojan-go         # 确认端口已监听
+```
+
+正常启动后日志中没有 `FATAL`。如果服务器的 IPv6 不可用，会看到下面这行，属于正常现象，出站连接会自动使用 IPv4：
+
+```text
+ipv6 connectivity is not available on this host, preferring ipv4 for outbound connections
+```
+
+如需排查问题，可以在 `config.json` 中加入 `"log_level": 0` 打开调试日志，然后执行 `docker compose restart`。
+
+### 5. 常用操作
+
+```shell
+docker compose restart            # 修改 config.json 后重启生效
+git pull && docker compose up -d --build   # 更新代码并重新部署
+docker compose down               # 停止并删除容器
+```
+
+更新证书文件后同样需要 `docker compose restart`。如果希望自动加载新证书，可在 `ssl` 中设置 `"cert_check_rate": 3600`（单位：秒）。
+
 ## 特性
 
 一般情况下，Trojan-Go 和 Trojan 是互相兼容的，但一旦使用下面介绍的扩展特性（如多路复用、Websocket 等），则无法兼容。
