@@ -2,6 +2,9 @@
 
 A Trojan proxy server (WebSocket over TLS, works behind Cloudflare), deployed with Docker Compose.
 
+It comes with a built-in fake website: anyone who is not your proxy client (a browser, a scanner)
+sees an ordinary blog, so the server looks like a normal web site. Nothing else needs to be installed.
+
 ## Deploy
 
 **1. Get the code**
@@ -11,9 +14,13 @@ git clone -b fix/stability-and-docker-compose https://github.com/Jinjin89/trojan
 cd trojan-go
 ```
 
-**2. Edit `deploy/config.json`**
+**2. Create `deploy/config.json` from the template**
 
-Change these three things:
+```shell
+cp deploy/config.example.json deploy/config.json
+```
+
+Then edit `deploy/config.json` and change these three things:
 
 | Field | Set it to |
 | --- | --- |
@@ -37,6 +44,8 @@ docker compose up -d --build
 ```
 
 Done. Check it with `docker compose logs -f`. There should be no `FATAL` lines.
+
+Open `https://your-domain.com` in a browser: you should see the fake website.
 
 ## Client settings
 
@@ -71,8 +80,16 @@ If a container named `trojan-go` already exists from an earlier setup, remove it
 docker stop trojan-go && docker rm trojan-go
 ```
 
+## Fake website
+
+The site is the static page in `deploy/web/`, served by the `web` container. It listens only on
+`127.0.0.1:8088`, so it is never reachable directly from the internet, only through trojan-go.
+
+To use your own site, replace the files in `deploy/web/` (any static HTML works). Changes show up
+immediately, no restart needed.
+
 ## Notes
 
-- `remote_addr` / `remote_port` in the config point to a normal website on the server (e.g. nginx on port 80). Traffic that is not from your clients is sent there, so the server looks like a regular website. It is optional: without it, such traffic is simply closed.
-- Certificates in `deploy/cert/` are ignored by git. Don't commit `deploy/config.json` after putting your password in it.
+- `deploy/config.json` and the certificates in `deploy/cert/` are ignored by git, so your password and keys are never committed and `git pull` never conflicts with them.
+- If `docker compose up` fails with an error about `config.json` being a directory, you skipped step 2: run `rm -rf deploy/config.json`, then do step 2.
 - For debug logs, add `"log_level": 0` to the config and run `docker compose restart`.

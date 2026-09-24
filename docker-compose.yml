@@ -3,13 +3,34 @@
 # 1. edit deploy/config.json   (password and domain)
 # 2. put cert.pem and key.pem into deploy/cert/
 # 3. docker compose up -d --build
+#
+# Anyone who is not a proxy client (browsers, scanners) is shown the website
+# in deploy/web/, so the server looks like an ordinary web site.
 
 services:
+  # the fake website. only reachable from this machine; trojan-go forwards
+  # non-proxy traffic to it (remote_port / fallback_port in config.json)
+  web:
+    image: nginx:alpine
+    container_name: trojan-go-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - ./deploy/web:/usr/share/nginx/html:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   trojan-go:
     build: .
     image: trojan-go:local
     container_name: trojan-go
     restart: unless-stopped
+    depends_on:
+      - web
     # host networking avoids the docker-proxy hop and NAT: lower latency, higher throughput
     network_mode: host
     volumes:

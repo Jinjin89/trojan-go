@@ -3,14 +3,16 @@
   "local_addr": "0.0.0.0",
   "local_port": 443,
   "remote_addr": "127.0.0.1",
-  "remote_port": 80,
+  "remote_port": 8088,
   "password": [
     "CHANGE_ME"
   ],
   "ssl": {
     "cert": "/cert/cert.pem",
     "key": "/cert/key.pem",
-    "sni": "your-domain.com"
+    "sni": "your-domain.com",
+    "fallback_addr": "127.0.0.1",
+    "fallback_port": 8088
   },
   "websocket": {
     "enabled": true,
