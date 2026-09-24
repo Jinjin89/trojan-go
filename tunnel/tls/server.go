@@ -59,6 +59,11 @@ func (s *Server) Close() error {
 	return s.underlay.Close()
 }
 
+// handshakeTimeout bounds the time an inbound connection may spend in the TLS
+// handshake and in sending its first request. Without it, idle or malicious
+// connections pin goroutines and file descriptors forever.
+const handshakeTimeout = 15 * time.Second
+
 func isDomainNameMatched(pattern string, domainName string) bool {
 	if strings.HasPrefix(pattern, "*.") {
 		suffix := pattern[2:]
@@ -101,8 +106,10 @@ func (s *Server) acceptLoop() {
 							break
 						}
 					}
-					if s.verifySNI && !matched {
-						return nil, common.NewError("sni mismatched: " + hello.ServerName + ", expected: " + s.sni)
+					// clients without SNI (e.g. connecting by IP) get the default certificate,
+					// just like a normal web server would serve its default site
+					if s.verifySNI && !matched && hello.ServerName != "" {
+						return nil, common.NewError("sni mismatched: " + hello.ServerName + ", expected: " + sni)
 					}
 					return &s.keyPair[0], nil
 				},
@@ -114,14 +121,16 @@ func (s *Server) acceptLoop() {
 			handshakeRewindConn.SetBufferSize(2048)
 
 			tlsConn := tls.Server(handshakeRewindConn, tlsConfig)
-			err = tlsConn.Handshake()
+			conn.SetDeadline(time.Now().Add(handshakeTimeout))
+			err := tlsConn.Handshake()
 			handshakeRewindConn.StopBuffering()
 
 			if err != nil {
 				if strings.Contains(err.Error(), "first record does not look like a TLS handshake") {
 					// not a valid tls client hello
 					handshakeRewindConn.Rewind()
-					log.Error(common.NewError("failed to perform tls handshake with " + tlsConn.RemoteAddr().String() + ", redirecting").Base(err))
+					conn.SetDeadline(time.Time{})
+					log.Debug(common.NewError("failed to perform tls handshake with " + tlsConn.RemoteAddr().String() + ", redirecting").Base(err))
 					switch {
 					case s.fallbackAddress != nil:
 						s.redir.Redirect(&redirector.Redirection{
@@ -135,9 +144,10 @@ func (s *Server) acceptLoop() {
 						handshakeRewindConn.Close()
 					}
 				} else {
-					// in other cases, simply close it
+					// in other cases, simply close it. these are almost always scanners
+					// or broken clients, so keep them out of the error log
 					tlsConn.Close()
-					log.Error(common.NewError("tls handshake failed").Base(err))
+					log.Debug(common.NewError("tls handshake failed from " + conn.RemoteAddr().String()).Base(err))
 				}
 				return
 			}
@@ -151,17 +161,24 @@ func (s *Server) acceptLoop() {
 			rewindConn.SetBufferSize(1024)
 			r := bufio.NewReader(rewindConn)
 			httpReq, err := http.ReadRequest(r)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// real clients send their request right after the handshake
+				log.Debug("tls connection from", conn.RemoteAddr(), "sent nothing, closing")
+				tlsConn.Close()
+				return
+			}
 			rewindConn.Rewind()
 			rewindConn.StopBuffering()
+			// the upper layers set their own deadlines
+			conn.SetDeadline(time.Time{})
+			var ch chan tunnel.Conn
 			if err != nil {
 				// this is not a http request. pass it to trojan protocol layer for further inspection
-				s.connChan <- &transport.Conn{
-					Conn: rewindConn,
-				}
+				ch = s.connChan
 			} else {
 				if atomic.LoadInt32(&s.nextHTTP) != 1 {
 					// there is no websocket layer waiting for connections, redirect it
-					log.Error("incoming http request, but no websocket server is listening")
+					log.Debug("incoming http request, but no websocket server is listening")
 					s.redir.Redirect(&redirector.Redirection{
 						InboundConn: rewindConn,
 						RedirectTo:  s.fallbackAddress,
@@ -170,9 +187,12 @@ func (s *Server) acceptLoop() {
 				}
 				// this is a http request, pass it to websocket protocol layer
 				log.Debug("http req: ", httpReq)
-				s.wsChan <- &transport.Conn{
-					Conn: rewindConn,
-				}
+				ch = s.wsChan
+			}
+			select {
+			case ch <- &transport.Conn{Conn: rewindConn}:
+			case <-s.ctx.Done():
+				rewindConn.Close()
 			}
 		}(conn)
 	}
@@ -207,24 +227,26 @@ func (s *Server) checkKeyPairLoop(checkRate time.Duration, keyPath string, certP
 	var lastKeyBytes, lastCertBytes []byte
 	ticker := time.NewTicker(checkRate)
 
-	for {
+	defer ticker.Stop()
+
+	check := func() {
 		log.Debug("checking cert...")
 		keyBytes, err := ioutil.ReadFile(keyPath)
 		if err != nil {
 			log.Error(common.NewError("tls failed to check key").Base(err))
-			continue
+			return
 		}
 		certBytes, err := ioutil.ReadFile(certPath)
 		if err != nil {
 			log.Error(common.NewError("tls failed to check cert").Base(err))
-			continue
+			return
 		}
 		if !bytes.Equal(keyBytes, lastKeyBytes) || !bytes.Equal(lastCertBytes, certBytes) {
 			log.Info("new key pair detected")
 			keyPair, err := loadKeyPair(keyPath, certPath, password)
 			if err != nil {
 				log.Error(common.NewError("tls failed to load new key pair").Base(err))
-				continue
+				return
 			}
 			s.keyPairLock.Lock()
 			s.keyPair = []tls.Certificate{*keyPair}
@@ -232,13 +254,15 @@ func (s *Server) checkKeyPairLoop(checkRate time.Duration, keyPath string, certP
 			lastKeyBytes = keyBytes
 			lastCertBytes = certBytes
 		}
+	}
 
+	for {
+		check()
 		select {
 		case <-ticker.C:
 			continue
 		case <-s.ctx.Done():
 			log.Debug("exiting")
-			ticker.Stop()
 			return
 		}
 	}
@@ -252,20 +276,20 @@ func loadKeyPair(keyPath string, certPath string, password string) (*tls.Certifi
 		}
 		keyBlock, _ := pem.Decode(keyFile)
 		if keyBlock == nil {
-			return nil, common.NewError("failed to decode key file").Base(err)
+			return nil, common.NewError("failed to decode key file")
 		}
 		decryptedKey, err := x509.DecryptPEMBlock(keyBlock, []byte(password))
-		if err == nil {
+		if err != nil {
 			return nil, common.NewError("failed to decrypt key").Base(err)
 		}
 
 		certFile, err := ioutil.ReadFile(certPath)
-		certBlock, _ := pem.Decode(certFile)
-		if certBlock == nil {
-			return nil, common.NewError("failed to decode cert file").Base(err)
+		if err != nil {
+			return nil, common.NewError("failed to load cert file").Base(err)
 		}
-
-		keyPair, err := tls.X509KeyPair(certBlock.Bytes, decryptedKey)
+		// tls.X509KeyPair expects PEM input for both arguments
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: keyBlock.Type, Bytes: decryptedKey})
+		keyPair, err := tls.X509KeyPair(certFile, keyPEM)
 		if err != nil {
 			return nil, err
 		}
@@ -299,11 +323,12 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 			log.Warn("empty tls fallback address")
 		}
 		fallbackAddress = tunnel.NewAddressFromHostPort("tcp", cfg.TLS.FallbackHost, cfg.TLS.FallbackPort)
-		fallbackConn, err := net.Dial("tcp", fallbackAddress.String())
+		fallbackConn, err := net.DialTimeout("tcp", fallbackAddress.String(), 5*time.Second)
 		if err != nil {
-			return nil, common.NewError("invalid fallback address").Base(err)
+			log.Warn(common.NewError("tls fallback address is not reachable now: " + fallbackAddress.String()).Base(err))
+		} else {
+			fallbackConn.Close()
 		}
-		fallbackConn.Close()
 	} else {
 		log.Warn("empty tls fallback port")
 		if cfg.TLS.HTTPResponseFileName != "" {
@@ -319,7 +344,7 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 
 	keyPair, err := loadKeyPair(cfg.TLS.KeyPath, cfg.TLS.CertPath, cfg.TLS.KeyPassword)
 	if err != nil {
-		return nil, common.NewError("tls failed to load key pair")
+		return nil, common.NewError("tls failed to load key pair").Base(err)
 	}
 
 	var keyLogger io.WriteCloser

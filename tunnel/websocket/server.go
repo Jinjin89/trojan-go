@@ -42,6 +42,7 @@ type Server struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	timeout   time.Duration
+	connChan  chan tunnel.Conn
 }
 
 func (s *Server) Close() error {
@@ -49,11 +50,37 @@ func (s *Server) Close() error {
 	return s.underlay.Close()
 }
 
-func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
-	conn, err := s.underlay.AcceptConn(&Tunnel{})
-	if err != nil {
-		return nil, common.NewError("websocket failed to accept connection from underlying server")
+// acceptLoop accepts connections from the underlying layer and performs the
+// websocket handshake for each of them concurrently. Handshaking inline would
+// let a single slow or broken client stall every other incoming connection.
+func (s *Server) acceptLoop() {
+	for {
+		conn, err := s.underlay.AcceptConn(&Tunnel{})
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+			}
+			log.Error(common.NewError("websocket failed to accept connection from underlying server").Base(err))
+			continue
+		}
+		go func(conn tunnel.Conn) {
+			wsConn, err := s.handshake(conn)
+			if err != nil {
+				log.Debug(err)
+				return
+			}
+			select {
+			case s.connChan <- wsConn:
+			case <-s.ctx.Done():
+				wsConn.Close()
+			}
+		}(conn)
 	}
+}
+
+func (s *Server) handshake(conn tunnel.Conn) (tunnel.Conn, error) {
 	if !s.enabled {
 		s.redir.Redirect(&redirector.Redirection{
 			InboundConn: conn,
@@ -61,6 +88,8 @@ func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 		})
 		return nil, common.NewError("websocket is disabled. redirecting http request from " + conn.RemoteAddr().String())
 	}
+	// bound the time a client may take to complete the upgrade request
+	conn.SetDeadline(time.Now().Add(s.timeout))
 	rewindConn := common.NewRewindConn(conn)
 	rewindConn.SetBufferSize(512)
 	defer rewindConn.StopBuffering()
@@ -70,6 +99,7 @@ func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 		log.Debug("invalid http request")
 		rewindConn.Rewind()
 		rewindConn.StopBuffering()
+		conn.SetDeadline(time.Time{})
 		s.redir.Redirect(&redirector.Redirection{
 			InboundConn: rewindConn,
 			RedirectTo:  s.redirAddr,
@@ -80,32 +110,32 @@ func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 		log.Debug("invalid http websocket handshake request")
 		rewindConn.Rewind()
 		rewindConn.StopBuffering()
+		conn.SetDeadline(time.Time{})
 		s.redir.Redirect(&redirector.Redirection{
 			InboundConn: rewindConn,
 			RedirectTo:  s.redirAddr,
 		})
-		return nil, common.NewError("not a valid websocket handshake request: " + conn.RemoteAddr().String()).Base(err)
+		return nil, common.NewError("not a valid websocket handshake request: " + conn.RemoteAddr().String())
 	}
-
-	handshake := make(chan struct{})
 
 	url := "wss://" + s.hostname + s.path
 	origin := "https://" + s.hostname
 	wsConfig, err := websocket.NewConfig(url, origin)
 	if err != nil {
+		conn.Close()
 		return nil, common.NewError("failed to create websocket config").Base(err)
 	}
-	var wsConn *websocket.Conn
+	// buffered, so that a late handshake never blocks the handler goroutine forever
+	handshake := make(chan *websocket.Conn, 1)
 	ctx, cancel := context.WithCancel(s.ctx)
 
 	wsServer := websocket.Server{
 		Config: *wsConfig,
-		Handler: func(conn *websocket.Conn) {
-			wsConn = conn                              // store the websocket after handshaking
+		Handler: func(wsConn *websocket.Conn) {
 			wsConn.PayloadType = websocket.BinaryFrame // treat it as a binary websocket
 
 			log.Debug("websocket obtained")
-			handshake <- struct{}{}
+			handshake <- wsConn
 			// this function SHOULD NOT return unless the connection is ended
 			// or the websocket will be closed by ServeHTTP method
 			<-ctx.Done()
@@ -121,26 +151,42 @@ func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
 		Conn:       conn,
 		ReadWriter: rw,
 	}
-	go wsServer.ServeHTTP(respWriter, req)
+	served := make(chan struct{})
+	go func() {
+		wsServer.ServeHTTP(respWriter, req)
+		close(served)
+	}()
 
+	timer := time.NewTimer(s.timeout)
+	defer timer.Stop()
 	select {
-	case <-handshake:
-	case <-time.After(s.timeout):
+	case wsConn := <-handshake:
+		conn.SetDeadline(time.Time{})
+		return &InboundConn{
+			OutboundConn: OutboundConn{
+				tcpConn: conn,
+				Conn:    wsConn,
+			},
+			ctx:    ctx,
+			cancel: cancel,
+		}, nil
+	case <-served:
+		// ServeHTTP returned without calling the handler: the upgrade was rejected
+	case <-timer.C:
+	case <-s.ctx.Done():
 	}
+	cancel()
+	conn.Close()
+	return nil, common.NewError("websocket failed to handshake with " + conn.RemoteAddr().String())
+}
 
-	if wsConn == nil {
-		cancel()
-		return nil, common.NewError("websocket failed to handshake")
+func (s *Server) AcceptConn(tunnel.Tunnel) (tunnel.Conn, error) {
+	select {
+	case conn := <-s.connChan:
+		return conn, nil
+	case <-s.ctx.Done():
+		return nil, common.NewError("websocket server closed")
 	}
-
-	return &InboundConn{
-		OutboundConn: OutboundConn{
-			tcpConn: conn,
-			Conn:    wsConn,
-		},
-		ctx:    ctx,
-		cancel: cancel,
-	}, nil
 }
 
 func (s *Server) AcceptPacket(tunnel.Tunnel) (tunnel.PacketConn, error) {
@@ -163,8 +209,7 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 		cfg.RemotePort = 80
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	log.Debug("websocket server created")
-	return &Server{
+	server := &Server{
 		enabled:   cfg.Websocket.Enabled,
 		hostname:  cfg.Websocket.Host,
 		path:      cfg.Websocket.Path,
@@ -174,5 +219,9 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 		timeout:   time.Second * time.Duration(rand.Intn(10)+5),
 		redir:     redirector.NewRedirector(ctx),
 		redirAddr: tunnel.NewAddressFromHostPort("tcp", cfg.RemoteHost, cfg.RemotePort),
-	}, nil
+		connChan:  make(chan tunnel.Conn, 32),
+	}
+	go server.acceptLoop()
+	log.Debug("websocket server created")
+	return server, nil
 }

@@ -63,7 +63,8 @@ func (p *Proxy) relayConnLoop() {
 					defer inbound.Close()
 					outbound, err := p.sink.DialConn(inbound.Metadata().Address, nil)
 					if err != nil {
-						log.Error(common.NewError("proxy failed to dial connection").Base(err))
+						// the target being unreachable is not a server fault
+						log.Warn(common.NewError("proxy failed to dial connection").Base(err))
 						return
 					}
 					defer outbound.Close()
@@ -76,7 +77,7 @@ func (p *Proxy) relayConnLoop() {
 					go copyConn(outbound, inbound)
 					select {
 					case err = <-errChan:
-						if err != nil {
+						if err != nil && !common.IsClosedError(err) {
 							log.Error(err)
 						}
 					case <-p.ctx.Done():
@@ -115,8 +116,8 @@ func (p *Proxy) relayPacketLoop() {
 					defer outbound.Close()
 					errChan := make(chan error, 2)
 					copyPacket := func(a, b tunnel.PacketConn) {
+						buf := make([]byte, MaxPacketSize)
 						for {
-							buf := make([]byte, MaxPacketSize)
 							n, metadata, err := a.ReadWithMetadata(buf)
 							if err != nil {
 								errChan <- err
@@ -137,7 +138,8 @@ func (p *Proxy) relayPacketLoop() {
 					go copyPacket(outbound, inbound)
 					select {
 					case err = <-errChan:
-						if err != nil {
+						// EOF here just means the client closed its udp session
+						if err != nil && !common.IsClosedError(err) {
 							log.Error(err)
 						}
 					case <-p.ctx.Done():

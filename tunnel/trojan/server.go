@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/p4gefau1t/trojan-go/api"
 	"github.com/p4gefau1t/trojan-go/common"
@@ -105,6 +106,9 @@ func (c *InboundConn) Auth() error {
 	return nil
 }
 
+// authTimeout bounds the time a client may take to send the trojan request header
+const authTimeout = 30 * time.Second
+
 // Server is a trojan tunnel server
 type Server struct {
 	auth       statistic.Authenticator
@@ -145,7 +149,12 @@ func (s *Server) acceptLoop() {
 				auth: s.auth,
 			}
 
-			if err := inboundConn.Auth(); err != nil {
+			// a real client sends its trojan header right away; don't let idle
+			// connections hold resources forever
+			conn.SetReadDeadline(time.Now().Add(authTimeout))
+			err := inboundConn.Auth()
+			conn.SetReadDeadline(time.Time{})
+			if err != nil {
 				rewindConn.Rewind()
 				rewindConn.StopBuffering()
 				log.Warn(common.NewError("connection with invalid trojan header from " + rewindConn.RemoteAddr().String()).Base(err))
@@ -157,26 +166,36 @@ func (s *Server) acceptLoop() {
 			}
 
 			rewindConn.StopBuffering()
+			var connChan chan tunnel.Conn
 			switch inboundConn.metadata.Command {
 			case Connect:
 				if inboundConn.metadata.DomainName == "MUX_CONN" {
-					s.muxChan <- inboundConn
+					connChan = s.muxChan
 					log.Debug("mux(r) connection")
 				} else {
-					s.connChan <- inboundConn
+					connChan = s.connChan
 					log.Debug("normal trojan connection")
 				}
-
 			case Associate:
-				s.packetChan <- &PacketConn{
-					Conn: inboundConn,
-				}
 				log.Debug("trojan udp connection")
+				select {
+				case s.packetChan <- &PacketConn{Conn: inboundConn}:
+				case <-s.ctx.Done():
+					inboundConn.Close()
+				}
+				return
 			case Mux:
-				s.muxChan <- inboundConn
+				connChan = s.muxChan
 				log.Debug("mux connection")
 			default:
 				log.Error(common.NewError(fmt.Sprintf("unknown trojan command %d", inboundConn.metadata.Command)))
+				inboundConn.Close()
+				return
+			}
+			select {
+			case connChan <- inboundConn:
+			case <-s.ctx.Done():
+				inboundConn.Close()
 			}
 		}(conn)
 	}
@@ -247,12 +266,14 @@ func NewServer(ctx context.Context, underlay tunnel.Server) (*Server, error) {
 	}
 
 	if !cfg.DisableHTTPCheck {
-		redirConn, err := net.Dial("tcp", redirAddr.String())
+		// the http server may simply not be up yet (e.g. right after boot), so
+		// don't refuse to start: invalid requests will be redirected once it is
+		redirConn, err := net.DialTimeout("tcp", redirAddr.String(), 5*time.Second)
 		if err != nil {
-			cancel()
-			return nil, common.NewError("invalid redirect address. check your http server: " + redirAddr.String()).Base(err)
+			log.Warn(common.NewError("redirect address is not reachable now. check your http server: " + redirAddr.String()).Base(err))
+		} else {
+			redirConn.Close()
 		}
-		redirConn.Close()
 	}
 
 	go s.acceptLoop()

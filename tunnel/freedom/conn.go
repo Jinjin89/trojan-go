@@ -21,8 +21,15 @@ func (c *Conn) Metadata() *tunnel.Metadata {
 	return nil
 }
 
+// maxResolveCacheSize bounds the per-session cache of resolved udp targets
+const maxResolveCacheSize = 256
+
 type PacketConn struct {
 	*net.UDPConn
+	preferIPv4 bool
+	// resolved caches domain name lookups, so that a udp session does not
+	// query DNS for every single packet. only the writing goroutine uses it.
+	resolved map[string]*net.UDPAddr
 }
 
 func (c *PacketConn) WriteWithMetadata(p []byte, m *tunnel.Metadata) (int, error) {
@@ -35,7 +42,9 @@ func (c *PacketConn) ReadWithMetadata(p []byte) (int, *tunnel.Metadata, error) {
 		return 0, nil, err
 	}
 	address, err := tunnel.NewAddressFromAddr("udp", addr.String())
-	common.Must(err)
+	if err != nil {
+		return 0, nil, err
+	}
 	metadata := &tunnel.Metadata{
 		Address: address,
 	}
@@ -46,13 +55,27 @@ func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if udpAddr, ok := addr.(*net.UDPAddr); ok {
 		return c.WriteToUDP(p, udpAddr)
 	}
-	ip, err := addr.(*tunnel.Address).ResolveIP()
-	if err != nil {
-		return 0, err
+	address, ok := addr.(*tunnel.Address)
+	if !ok {
+		return 0, common.NewError("unsupported udp address type " + addr.String())
 	}
-	udpAddr := &net.UDPAddr{
-		IP:   ip,
-		Port: addr.(*tunnel.Address).Port,
+	network := "udp"
+	if c.preferIPv4 {
+		// the socket is udp4, so the target must resolve to an ipv4 address
+		network = "udp4"
+	}
+	key := address.String()
+	udpAddr, found := c.resolved[key]
+	if !found {
+		var err error
+		udpAddr, err = net.ResolveUDPAddr(network, key)
+		if err != nil {
+			return 0, err
+		}
+		if c.resolved == nil || len(c.resolved) >= maxResolveCacheSize {
+			c.resolved = make(map[string]*net.UDPAddr)
+		}
+		c.resolved[key] = udpAddr
 	}
 	return c.WriteToUDP(p, udpAddr)
 }

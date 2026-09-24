@@ -44,7 +44,8 @@ func (s *Server) acceptConnWorker() {
 				for {
 					stream, err := session.AcceptStream()
 					if err != nil {
-						log.Error(err)
+						// session ended, or the client does not speak smux (e.g. "invalid protocol")
+						log.Debug(common.NewError("mux session from " + conn.RemoteAddr().String() + " ended").Base(err))
 						return
 					}
 					select {

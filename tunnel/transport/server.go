@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -38,17 +39,30 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) acceptLoop() {
+	var backoff time.Duration
 	for {
 		tcpConn, err := s.tcpListener.Accept()
 		if err != nil {
 			select {
 			case <-s.ctx.Done():
+				return
 			default:
-				log.Error(common.NewError("transport accept error").Base(err))
-				time.Sleep(time.Millisecond * 100)
 			}
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// errors such as "too many open files" are transient. returning here
+			// would leave the port open but never serve anyone again.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff *= 2; backoff > time.Second {
+				backoff = time.Second
+			}
+			log.Error(common.NewError("transport accept error, retrying in " + backoff.String()).Base(err))
+			time.Sleep(backoff)
+			continue
 		}
+		backoff = 0
 
 		go func(tcpConn net.Conn) {
 			log.Info("tcp connection from", tcpConn.RemoteAddr())
@@ -64,22 +78,25 @@ func (s *Server) acceptLoop() {
 				httpReq, err := http.ReadRequest(r)
 				rewindConn.Rewind()
 				rewindConn.StopBuffering()
+				ch := s.connChan
 				if err != nil {
 					// this is not a http request, pass it to trojan protocol layer for further inspection
-					s.connChan <- &Conn{
-						Conn: rewindConn,
-					}
 				} else {
 					// this is a http request, pass it to websocket protocol layer
 					log.Debug("plaintext http request: ", httpReq)
-					s.wsChan <- &Conn{
-						Conn: rewindConn,
-					}
+					ch = s.wsChan
+				}
+				select {
+				case ch <- &Conn{Conn: rewindConn}:
+				case <-s.ctx.Done():
+					rewindConn.Close()
 				}
 			} else {
 				s.httpLock.RUnlock()
-				s.connChan <- &Conn{
-					Conn: tcpConn,
+				select {
+				case s.connChan <- &Conn{Conn: tcpConn}:
+				case <-s.ctx.Done():
+					tcpConn.Close()
 				}
 			}
 		}(tcpConn)

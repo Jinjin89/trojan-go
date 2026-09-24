@@ -41,8 +41,10 @@ func init() {
 			TLS: TLSConfig{
 				Verify:         true,
 				VerifyHostName: true,
-				Fingerprint:    "",
-				ALPN:           []string{"http/1.1"},
+				// session resumption saves a full handshake on reconnects
+				ReuseSession: true,
+				Fingerprint:  "",
+				ALPN:         []string{"http/1.1"},
 			},
 		}
 	})

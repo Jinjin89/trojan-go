@@ -1,0 +1,37 @@
+# Trojan-Go server built from this source tree.
+#
+#   docker compose up -d --build     # build and start
+#   docker compose logs -f           # follow logs
+#
+# Drop-in replacement for the p4gefau1t/trojan-go:latest container: the
+# config and certificates are mounted at the same paths, so the server config
+# and all clients keep working unchanged. Override the host paths with
+# environment variables (or a .env file next to this file) on other machines:
+#
+#   TROJAN_CONFIG_DIR  directory containing config.json
+#   TROJAN_CERT_DIR    directory containing the certificates referenced in it
+
+services:
+  trojan-go:
+    build: .
+    image: trojan-go:local
+    container_name: trojan-go
+    restart: unless-stopped
+    # host networking avoids the docker-proxy hop and NAT: lower latency, higher throughput
+    network_mode: host
+    volumes:
+      - ${TROJAN_CONFIG_DIR:-/root/tg/kuan/trojan-go/config}:/tg/config:ro
+      - ${TROJAN_CERT_DIR:-/root/tg/kuan/cert}:/cert:ro
+    command: ["/tg/config/config.json"]
+    # every proxied connection uses at least two file descriptors; the docker
+    # default soft limit of 1024 is far too low for a busy proxy
+    ulimits:
+      nofile:
+        soft: 524288
+        hard: 524288
+    # keep the log from filling the disk
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
