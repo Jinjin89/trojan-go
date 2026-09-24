@@ -1,0 +1,3 @@
+# keep certificates and keys out of git
+*
+!.gitignore

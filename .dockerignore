@@ -5,3 +5,5 @@ docs
 *.zip
 *.dat
 .env
+# deployment files (password, certificates) must never end up in the image
+deploy
